@@ -84,6 +84,12 @@ def _log_finished(
     log.info("webhook_processing_finished", **fields)
 
 
+def _is_auto_cancel_status(data: dict[str, Any]) -> bool:
+    """Rubitime status 4 means auto-cancel by non-payment."""
+    status = data.get("status")
+    return status == 4 or status == "4"
+
+
 def process_webhook(event: str, record_id: int, data: dict[str, Any]) -> None:
     """Background worker: sync record to Google Calendar."""
     settings = get_settings()
@@ -113,6 +119,17 @@ def process_webhook(event: str, record_id: int, data: dict[str, Any]) -> None:
                 result=result,
             )
         elif event == "event-update-record":
+            if _is_auto_cancel_status(data):
+                delete_result = calendar.delete_event(event_id)
+                _log_finished(
+                    operation=event,
+                    record_id=record_id,
+                    event_id=event_id,
+                    outcome=delete_result.get("outcome", "deleted"),
+                    google_action="delete",
+                    result=delete_result,
+                )
+                return
             payload = formatter.build(record_id, data, event)
             result, google_action = _upsert_event(
                 calendar, event_id, payload, prefer="update"
