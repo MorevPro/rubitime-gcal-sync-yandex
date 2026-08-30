@@ -1,0 +1,1 @@
+"""rubitime → Google Calendar integration."""

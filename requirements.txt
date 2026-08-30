@@ -1,0 +1,6 @@
+pydantic>=2
+python-dotenv>=1.0
+google-api-python-client>=2.100
+google-auth>=2.23
+tzdata>=2022.1
+structlog>=24.1
