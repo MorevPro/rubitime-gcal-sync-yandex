@@ -1,184 +1,166 @@
-# Rubitime → Google Calendar (Yandex Cloud Functions)
+# Rubitime -> Google Calendar
 
-Serverless-версия [rubitime-gcal-sync](../rubitime-gcal-sync): та же бизнес-логика
-(вебхуки Rubitime и периодическая синхронизация свободных слотов в Google Calendar),
-но развёрнутая как пара функций в Yandex Cloud Functions вместо постоянно работающего
-FastAPI-сервиса в Docker.
+Serverless-сервис для синхронизации записей Rubitime и свободных слотов с Google Calendar. Сервис работает в Yandex Cloud Functions и состоит из двух функций:
 
-## Что перенесено, а что изменилось
+- `webhook_handler.handler` принимает вебхуки Rubitime и создаёт, обновляет или удаляет события в Google Calendar.
+- `schedule_handler.handler` периодически получает свободные слоты Rubitime и синхронизирует их с Google Calendar.
 
-Код синхронизации (`app/services`, `app/models`, `app/utils`) перенесён **без изменений** —
-он не зависел от FastAPI и работает одинаково в обоих проектах. Изменился только
-транспортный слой:
+Serverless-версия [rubitime-gcal-sync](https://github.com/MorevPro/rubitime-gcal-sync-yandex/blob/rubitime-gcal-sync).
 
-| Было (FastAPI) | Стало (Yandex Cloud Functions) |
+## Возможности
+
+- Приём webhook-событий Rubitime через HTTPS.
+- Создание записи в Google Calendar по `event-create-record`.
+- Обновление записи по `event-update-record`.
+- Удаление записи по `event-remove-record`.
+- Автоматическое удаление события при `event-update-record` со статусом `4` (`Автоотмена через 15 минут` при неоплате).
+- Идемпотентная синхронизация: если событие уже отсутствует при удалении, это считается успешным результатом.
+- Синхронизация свободных слотов по расписанию Yandex Cloud Timer.
+- Настройка часового пояса, адреса, цветов и шаблона названия события через переменные окружения.
+- Подробные однострочные JSON-логи для диагностики webhook-обработки и Google Calendar API.
+
+## Обработка webhook-событий
+
+Для записи Rubitime с идентификатором `8986532` используется Google event ID `booked8986532`.
+
+| Событие Rubitime | Действие |
 |---|---|
-| `POST /webhook` в приложении, поднятом в Docker | функция `webhook_handler.handler`, вызываемая напрямую по HTTPS или через API Gateway |
-| Фоновая asyncio-задача каждые `RUBITIME_SYNC_INTERVAL_SECONDS` | функция `schedule_handler.handler`, вызываемая по расписанию Yandex Cloud Trigger (Timer) |
-| Ключ Google — файл, смонтированный в Docker (`GOOGLE_SERVICE_ACCOUNT_JSON_FILE`) | переменная окружения `GOOGLE_SERVICE_ACCOUNT_JSON` (рекомендуется — секрет Lockbox) |
-| Ответ на вебхук мгновенный, синк идёт в фоне | ответ на вебхук возвращается **после** синхронизации с Google Calendar (функция не может продолжать работу после ответа) |
+| `event-create-record` | Создать событие; при дубликате выполнить обновление |
+| `event-update-record` со статусом, отличным от `4` | Обновить событие; если оно отсутствует, создать его |
+| `event-update-record` со статусом `4` | Удалить событие и не создавать его заново |
+| `event-remove-record` | Удалить событие |
 
-`process_webhook` по-прежнему сам перехватывает и логирует все исключения, поэтому
-вебхук всегда отвечает `{"ok": true, "accepted": true, ...}`, даже если синхронизация
-с Google Calendar внутри не удалась — как и в исходном сервисе.
+Статус `4` проверяется как числовое значение `4` и как строка `"4"`. Поэтому запись из webhook с полем `"status": 4` не будет превращена в событие с заголовком `❌`: существующее событие будет удалено вызовом Google Calendar API.
 
-`GET /health` как отдельный endpoint не нужен: обе функции проверяются вызовом
-(`webhook_handler` отвечает на `GET` тем же `{"ok": true}`), а работоспособность —
-через логи в Yandex Cloud Logging.
-
----
+Обработчик webhook возвращает Rubitime успешный ответ о приёме после выполнения синхронизации. Внутренние ошибки синхронизации перехватываются и записываются в лог `webhook_processing_failed`; результат необходимо проверять по логам Yandex Cloud.
 
 ## Структура проекта
 
-```
+```text
 rubitime-gcal-sync-yandex/
-├── webhook_handler.py       # Функция 1: приём вебхуков Rubitime
-├── schedule_handler.py      # Функция 2: синк свободных слотов (по Timer-триггеру)
+├── webhook_handler.py       # HTTP-функция приёма webhook-событий
+├── schedule_handler.py      # функция синхронизации свободных слотов
 ├── app/
-│   ├── config.py            # Настройки из переменных окружения
-│   ├── models/               # Pydantic-модели вебхука и события Google Calendar
-│   ├── routes/webhook.py     # process_webhook — бизнес-логика обработки события
-│   ├── services/              # CalendarService, EventFormatter, RubitimeScheduleSyncService
-│   └── utils/                 # datetime-хелперы, парсинг ошибок Google API, логирование
-├── tests/                     # pytest + один интерактивный скрипт (test_google_calendar.py)
-├── scripts/local_invoke.py    # ручной вызов handler'ов без деплоя
-├── deploy/deploy.ps1          # шаблон команд `yc` для создания функций и триггера
-├── requirements.txt           # рантайм-зависимости (устанавливаются Yandex Cloud при сборке)
-├── requirements-dev.txt       # + pytest, для локальной разработки
-├── .yandexignore              # что не попадает в архив при деплое (см. ниже)
-└── .env.example
+│   ├── config.py             # загрузка настроек из окружения и .env
+│   ├── models/               # модели webhook и Google Calendar события
+│   ├── routes/webhook.py     # обработка webhook-событий
+│   ├── services/              # CalendarService и сервисы Rubitime
+│   └── utils/                 # даты, логирование и обработка ошибок
+├── tests/                    # автоматические тесты
+├── scripts/local_invoke.py   # локальный вызов функций без деплоя
+├── deploy/deploy.ps1         # команды деплоя в Yandex Cloud
+├── requirements.txt           # зависимости runtime
+├── requirements-dev.txt       # зависимости для разработки
+├── .env.example               # пример локальной конфигурации
+└── .yandexignore              # исключения из архива функции
 ```
 
----
+## Настройка
 
-## Переменные окружения
+Скопируйте `.env.example` в `.env` и заполните значения:
 
-| Переменная | Обязательна | По умолчанию | Описание |
-|------------|-------------|--------------|----------|
-| `GOOGLE_CALENDAR_ID` | ✅ | — | ID календаря вида `xxxx@group.calendar.google.com` |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | ✅ (в облаке) | — | JSON-ключ сервисного аккаунта Google (сырой JSON или base64) |
-| `GOOGLE_SERVICE_ACCOUNT_JSON_FILE` | локально | — | Путь к файлу ключа — только для локального запуска/тестов |
-| `RUBITIME_API_KEY` | ✅ | — | API ключ Rubitime |
-| `RUBITIME_BRANCH_ID` | ✅ | — | ID филиала (> 0) |
-| `RUBITIME_COOPERATOR_ID` | ✅ | — | ID сотрудника (> 0) |
-| `RUBITIME_SERVICE_ID` | ✅ | — | ID услуги (> 0) |
-| `RUBITIME_ONLY_AVAILABLE` | ❌ | `false` | `true` для выбора только свободных слотов |
-| `EVENT_TIMEZONE` | ❌ | `Europe/Moscow` | Часовой пояс событий |
-| `EVENT_LOCATION` | ❌ | — | Адрес по умолчанию для события |
-| `GOOGLE_EVENT_COLOR_ID` | ❌ | `5` | Обычный цвет события в Google Calendar |
-| `GOOGLE_LONG_EVENT_COLOR_ID` | ❌ | `9` | Синий цвет для записей длительностью более 60 минут |
-| `CALENDAR_SUMMARY_TEMPLATE` | ❌ | `{payment_prefix}{name} | {price}` | Шаблон названий событий |
-| `LOG_LEVEL` | ❌ | `INFO` | Уровень логирования (`INFO`/`DEBUG`) |
+| Переменная | Обязательна | Значение по умолчанию | Описание |
+|---|---:|---|---|
+| `GOOGLE_CALENDAR_ID` | да | - | ID Google Calendar, например `xxxx@group.calendar.google.com` |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | в облаке | - | JSON-ключ Google service account, сырой JSON или base64 |
+| `GOOGLE_SERVICE_ACCOUNT_JSON_FILE` | локально | - | Путь к JSON-файлу ключа для локального запуска |
+| `RUBITIME_API_KEY` | да | - | API-ключ Rubitime |
+| `RUBITIME_BRANCH_ID` | да | `0` | ID филиала |
+| `RUBITIME_COOPERATOR_ID` | да | `0` | ID сотрудника |
+| `RUBITIME_SERVICE_ID` | да | `0` | ID услуги |
+| `RUBITIME_ONLY_AVAILABLE` | нет | `true` | Запрашивать только свободные слоты |
+| `EVENT_TIMEZONE` | нет | `Europe/Moscow` | Часовой пояс событий |
+| `EVENT_LOCATION` | нет | `Москва` | Адрес события по умолчанию |
+| `GOOGLE_EVENT_COLOR_ID` | нет | `5` | Цвет обычных событий |
+| `GOOGLE_LONG_EVENT_COLOR_ID` | нет | `9` | Цвет событий длительностью более 60 минут |
+| `CALENDAR_SUMMARY_TEMPLATE` | нет | `{payment_prefix}{name} | {price}` | Шаблон названия события |
+| `LOG_LEVEL` | нет | `INFO` | Уровень логирования |
 
-Интервал синхронизации свободных слотов (раньше `RUBITIME_SYNC_INTERVAL_SECONDS`)
-больше не читается из `.env` — он задаётся расписанием Yandex Cloud Trigger
-(`--cron-expression` в `deploy/deploy.ps1`).
+`RUBITIME_SYNC_INTERVAL_SECONDS` не используется. Интервал запуска задаётся cron-выражением Timer-триггера Yandex Cloud.
 
-### Секреты и переменные окружения
+### Доступ Google Calendar
 
-Ключ Google (`GOOGLE_SERVICE_ACCOUNT_JSON`) — чувствительные данные. Рекомендуется:
+1. Создайте Google service account и JSON-ключ.
+2. Откройте нужный календарь в Google Calendar и предоставьте service account доступ с правом изменения событий.
+3. Для облака храните JSON-ключ в Yandex Lockbox и подключайте его к функции как `GOOGLE_SERVICE_ACCOUNT_JSON`.
+4. Для локальной разработки укажите `GOOGLE_SERVICE_ACCOUNT_JSON_FILE`.
 
-1. Создать секрет в **Yandex Lockbox** с версией, содержащей ключ Google целиком.
-2. При создании версии функции подключить его как переменную окружения через `--secret`
-   (см. пример в `deploy/deploy.ps1`) — тогда значение не попадает в открытые настройки
-   функции и не светится в консоли/логах.
+Не добавляйте JSON-ключ в git и не передавайте его в открытой переменной окружения при production-деплое.
 
-Остальные переменные (Rubitime API key и т.д.) можно передавать как обычные
-`--environment` — они тоже не публичны, но не требуют отдельного секрет-хранилища.
+## Локальный запуск
 
----
+Требуется Python 3.12 или совместимая версия.
 
-## Локальная разработка
-
-```bash
+```powershell
 python -m venv .venv
-. .venv/Scripts/activate        # PowerShell: .venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 pip install -r requirements-dev.txt
-
-cp .env.example .env
-# заполните .env, положите рядом файл ключа Google (см. GOOGLE_SERVICE_ACCOUNT_JSON_FILE)
-
-pytest
+Copy-Item .env.example .env
 ```
 
-Ручной вызов обработчиков без деплоя:
+После заполнения `.env` запустите тесты:
 
-```bash
-python scripts/local_invoke.py webhook '{"event":"event-update-record","data":{"id":123,"parent_record":null,"name":"Test","record":"2026-08-20 15:00:00"}}'
+```powershell
+python -m pytest -q
+```
+
+Ручной вызов webhook-функции без деплоя:
+
+```powershell
+python scripts/local_invoke.py webhook '{"event":"event-update-record","data":{"id":8986532,"parent_record":null,"name":"ИВАН ИВАНОВ ИВАНОВИЧ","record":"2026-09-06 11:00:00","status":4}}'
+```
+
+Для запуска синхронизации свободных слотов:
+
+```powershell
 python scripts/local_invoke.py schedule
 ```
 
----
-
 ## Деплой в Yandex Cloud
 
-Требуется установленный и авторизованный [Yandex Cloud CLI](https://yandex.cloud/ru/docs/cli/quickstart)
-(`yc init`).
+Требуются установленный и авторизованный [Yandex Cloud CLI](https://yandex.cloud/ru/docs/cli/quickstart) и доступ к нужному каталогу облака.
 
-1. Заполните переменные в начале `deploy/deploy.ps1` (`FolderId`, `ServiceAccountId`,
-   идентификаторы секрета Lockbox).
-2. Запустите скрипт по шагам (создание функций → публикация версий → публичный доступ
-   к webhook-функции → доступ Timer → timer-триггер для schedule-функции).
+1. В начале `deploy/deploy.ps1` укажите `FolderId`, `ServiceAccountId`, имя функций и параметры Lockbox.
+2. Создайте `.env` на основе `.env.example` и заполните обязательные переменные.
+3. Запустите `deploy/deploy.ps1` в PowerShell.
+4. Скопируйте URL опубликованной webhook-функции в настройки webhook в Rubitime.
 
-Скрипт также выдаёт сервисному аккаунту функции роль `functions.functionInvoker` на
-schedule-функцию, чтобы Timer мог её вызывать. Скрипт рассчитан на первичное создание
-функций и Timer-триггера. При повторном полном
-запуске команды `create` могут вернуть ошибку, если объекты уже существуют; для обновления
-кода публикуйте новую версию функции, а существующий триггер повторно не создавайте.
+Скрипт создаёт две функции:
 
-Скрипт использует `--source-path .` — весь каталог проекта архивируется и заливается
-как код функции; `.yandexignore` исключает из архива тесты, `.env`, ключи, README и
-служебные файлы, оставляя только `app/`, `webhook_handler.py`, `schedule_handler.py`
-и `requirements.txt`.
+- `rubitime-gcal-webhook` с entrypoint `webhook_handler.handler`, публичным HTTP-вызовом и таймаутом `10s`.
+- `rubitime-gcal-schedule` с entrypoint `schedule_handler.handler` и таймаутом `60s`.
 
-После деплоя:
+Также скрипт выдаёт Timer доступ к schedule-функции и создаёт триггер `rubitime-gcal-schedule-timer`, запускающий синхронизацию каждые 5 минут (`*/5 * * * ? *`).
 
-- **Webhook**: укажите публичный HTTP-адрес `webhook_handler` (`yc serverless function get ...`)
-  как URL вебхука в настройках Rubitime — как раньше указывался `https://your-domain.com/webhook`.
-  Для кастомного домена/маршрутизации можно поставить перед функцией API Gateway.
-- **Schedule**: ничего указывать не нужно — Timer-триггер сам вызывает `schedule_handler`
-  по расписанию.
+Для повторного деплоя публикуйте новую версию функции. Команды создания уже существующих функций и триггера могут вернуть ошибку, поэтому их не нужно повторно выполнять без необходимости.
 
-### Что проверено
+## Мониторинг
 
-- `pytest`: все 22 теста проходят.
-- Реальный webhook create/update/delete успешно записал тестовое событие в Google Calendar,
-  после проверки тестовое событие было удалено.
-- Реальный вызов `schedule_handler` получил расписание Rubitime и синхронизировал свободные
-  слоты в Google Calendar.
-- Для Yandex Cloud проверены entrypoint'ы `webhook_handler.handler` и
-  `schedule_handler.handler`, runtime `python312`, Lockbox-секрет и Timer cron.
+Проверка списка версий функции:
 
-Для записей с `duration > 60` используется цвет `GOOGLE_LONG_EVENT_COLOR_ID` (по умолчанию
-`9`, синий blueberry). Запись длительностью ровно 60 минут остаётся в обычном цвете.
-
-В `.env.example` намеренно нет значения `GOOGLE_SERVICE_ACCOUNT_JSON`: в Yandex Cloud
-его нужно подключить из Lockbox через `deploy/deploy.ps1`. Для локального запуска используйте
-`GOOGLE_SERVICE_ACCOUNT_JSON_FILE` или задайте JSON напрямую в окружении.
-
-Важно: `webhook_handler` отвечает об успешном приёме даже если внутренняя синхронизация
-завершилась ошибкой, поэтому после деплоя проверяйте `google_calendar_error` и
-`webhook_processing_finished` в логах Yandex Cloud.
-
-### Мониторинг
-
-```bash
+```powershell
 yc serverless function version list --function-name rubitime-gcal-webhook
+```
+
+Чтение логов за последний час:
+
+```powershell
 yc logging read --group-id <log-group-id> --since 1h
 ```
 
-Формат логов (однострочный JSON, structlog) не изменился — те же события
-(`webhook_processing_finished`, `rubitime_schedule_sync_finished`,
-`google_calendar_error` и т.д.), что и в исходном сервисе.
+Полезные события логов:
 
----
+- `webhook_received` - webhook получен.
+- `webhook_accepted` - payload прошёл валидацию.
+- `webhook_processing_started` - начата обработка записи.
+- `google_calendar_request` и `google_calendar_response` - запрос и ответ Google Calendar API.
+- `webhook_processing_finished` - обработка завершена успешно.
+- `google_calendar_delete_idempotent` - событие уже отсутствовало при удалении.
+- `webhook_processing_failed` и `google_calendar_error` - ошибка обработки или API.
+- `rubitime_schedule_sync_finished` - завершена синхронизация свободных слотов.
 
-## Известные отличия от исходного сервиса
+Для кейса автоотмены ожидается `webhook_processing_finished` с `google_action: "delete"` и `outcome: "deleted"` либо `outcome: "already_absent"`. Записи с таким статусом не должны заканчиваться операцией `update` или `insert`.
 
-- Ответ на вебхук возвращается после завершения синка с Google Calendar (см. таблицу выше) —
-  тайм-аут функции (`--execution-timeout`) должен быть больше, чем типичное время
-  вызова Google Calendar API (по умолчанию в `deploy/deploy.ps1` — 10 секунд).
-- Нет `/health`-эндпоинта отдельно — здоровье проверяется по логам/успешным вызовам.
-- Нет Docker/docker-compose — деплой только через `yc` (Yandex Cloud CLI).
-- В Google API-клиенте при запуске на Python 3.10 появляется предупреждение о скором
-  прекращении поддержки; для Yandex Cloud выбран `python312`.
+## Лицензия
+
+Лицензия проекта указана в файле `LICENSE`.

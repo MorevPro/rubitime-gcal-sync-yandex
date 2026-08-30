@@ -4,6 +4,7 @@ import base64
 import json
 
 import webhook_handler
+from app.routes import webhook as webhook_route
 
 
 def _event(body: str, is_base64: bool = False, method: str = "POST") -> dict:
@@ -89,3 +90,51 @@ def test_webhook_returns_400_on_validation_error() -> None:
 
     assert response["statusCode"] == 400
     assert json.loads(response["body"]) == {"ok": False, "error": "validation_failed"}
+
+
+def test_process_webhook_deletes_auto_cancelled_updates(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeCalendar:
+        def __init__(self, settings: object) -> None:
+            calls["calendar_settings"] = settings
+
+        def delete_event(self, event_id: str) -> dict[str, object]:
+            calls["deleted_event_id"] = event_id
+            return {"google_event_id": event_id, "outcome": "deleted"}
+
+        def update_event(self, event_id: str, payload: object) -> dict[str, object]:
+            calls["unexpected_update"] = (event_id, payload)
+            return {"google_event_id": event_id, "outcome": "updated"}
+
+        def insert_event(self, event_id: str, payload: object) -> dict[str, object]:
+            calls["unexpected_insert"] = (event_id, payload)
+            return {"google_event_id": event_id, "outcome": "inserted"}
+
+    class FakeFormatter:
+        def __init__(self, settings: object) -> None:
+            calls["formatter_settings"] = settings
+
+        def build(self, record_id: int, data: dict[str, object], event: str) -> object:
+            calls["unexpected_build"] = (record_id, data, event)
+            return object()
+
+    monkeypatch.setattr(webhook_route, "CalendarService", FakeCalendar)
+    monkeypatch.setattr(webhook_route, "EventFormatter", FakeFormatter)
+
+    webhook_route.process_webhook(
+        "event-update-record",
+        8986532,
+        {
+            "id": 8986532,
+            "parent_record": None,
+            "status": 4,
+            "name": "ИВАН ИВАНОВ ИВАНОВИЧ",
+            "record": "2026-09-06 11:00:00",
+        },
+    )
+
+    assert calls["deleted_event_id"] == "booked8986532"
+    assert "unexpected_build" not in calls
+    assert "unexpected_update" not in calls
+    assert "unexpected_insert" not in calls
