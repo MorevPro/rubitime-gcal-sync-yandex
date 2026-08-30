@@ -9,16 +9,13 @@ $ErrorActionPreference = "Stop"
 # --- Настройки: заполните под себя ---------------------------------------
 $FolderId          = "<your-folder-id>"
 $ServiceAccountId  = "<function-service-account-id>"   # сервисный аккаунт ЯО для самой функции (не Google!)
-$WebhookFnName     = "rubitime-gcal-webhook"
+$WebhookFnName     = "webhook-62s55swk349fbv4pzn4qjtbn23rctsuk"
 $ScheduleFnName    = "rubitime-gcal-schedule"
 $Runtime           = "python312"
 $Memory            = "128m"
-$WebhookTimeout    = "10s"
+$WebhookTimeout    = "30s"
 $ScheduleTimeout   = "60s"
-$EnvFile           = ".env"                              # используется как источник переменных ниже
-$LockboxSecretId   = "<lockbox-secret-id>"
-$LockboxVersionId  = "<version-id>"                       # можно оставить пустым для текущей версии
-$LockboxSecretKey  = "<key-in-secret>"
+$EnvFile           = ".env"                              # источник переменных ниже
 # ---------------------------------------------------------------------------
 
 Set-Location (Split-Path -Parent $PSScriptRoot)
@@ -27,7 +24,7 @@ if (-not (Test-Path -LiteralPath $EnvFile)) {
     throw "Не найден файл $EnvFile. Скопируйте .env.example в .env и заполните значения."
 }
 
-foreach ($value in @($FolderId, $ServiceAccountId, $LockboxSecretId, $LockboxSecretKey)) {
+foreach ($value in @($FolderId, $ServiceAccountId, $WebhookFnName, $ScheduleFnName)) {
     if ([string]::IsNullOrWhiteSpace($value) -or $value.StartsWith("<")) {
         throw "Заполните обязательные параметры в начале deploy/deploy.ps1."
     }
@@ -47,37 +44,62 @@ function Require-EnvValue($key) {
     return $value
 }
 
-# Переменные окружения, пробрасываемые в обе функции.
-# ВАЖНО: GOOGLE_SERVICE_ACCOUNT_JSON держите в Lockbox-секрете, а не в открытом виде,
-# см. README.md -> "Секреты и переменные окружения". Ниже — вариант "напрямую в env"
-# для быстрого старта.
+# Google принимает JSON-ключ как сырой JSON или base64. Для функции используем
+# однострочное base64-значение, чтобы JSON не ломал аргумент --environment.
+$googleKeyFile = Get-EnvValue 'GOOGLE_SERVICE_ACCOUNT_JSON_FILE'
+if ([string]::IsNullOrWhiteSpace($googleKeyFile)) {
+    throw "В $EnvFile не заполнена GOOGLE_SERVICE_ACCOUNT_JSON_FILE."
+}
+if (-not [IO.Path]::IsPathRooted($googleKeyFile)) {
+    $googleKeyFile = Join-Path (Get-Location) $googleKeyFile
+}
+if (-not (Test-Path -LiteralPath $googleKeyFile -PathType Leaf)) {
+    throw "Не найден файл Google service account: $googleKeyFile"
+}
+$googleServiceAccountJson = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes((Get-Content -LiteralPath $googleKeyFile -Raw))
+)
+
+function Optional-EnvValue($key, $default) {
+    $value = Get-EnvValue $key
+    if ([string]::IsNullOrWhiteSpace($value)) { return $default }
+    return $value
+}
+
+# Все настройки передаются в environment обеих функций.
 $envVars = @(
     "GOOGLE_CALENDAR_ID=$(Require-EnvValue 'GOOGLE_CALENDAR_ID')",
-    "GOOGLE_EVENT_COLOR_ID=$(Get-EnvValue 'GOOGLE_EVENT_COLOR_ID')",
-    "GOOGLE_LONG_EVENT_COLOR_ID=$(Get-EnvValue 'GOOGLE_LONG_EVENT_COLOR_ID')",
+    "GOOGLE_SERVICE_ACCOUNT_JSON=$googleServiceAccountJson",
+    "GOOGLE_EVENT_COLOR_ID=$(Optional-EnvValue 'GOOGLE_EVENT_COLOR_ID' '5')",
+    "GOOGLE_LONG_EVENT_COLOR_ID=$(Optional-EnvValue 'GOOGLE_LONG_EVENT_COLOR_ID' '9')",
     "RUBITIME_API_KEY=$(Require-EnvValue 'RUBITIME_API_KEY')",
     "RUBITIME_BRANCH_ID=$(Require-EnvValue 'RUBITIME_BRANCH_ID')",
     "RUBITIME_COOPERATOR_ID=$(Require-EnvValue 'RUBITIME_COOPERATOR_ID')",
     "RUBITIME_SERVICE_ID=$(Require-EnvValue 'RUBITIME_SERVICE_ID')",
-    "RUBITIME_ONLY_AVAILABLE=$(Get-EnvValue 'RUBITIME_ONLY_AVAILABLE')",
-    "EVENT_TIMEZONE=$(Get-EnvValue 'EVENT_TIMEZONE')",
-    "EVENT_LOCATION=$(Get-EnvValue 'EVENT_LOCATION')",
-    "CALENDAR_SUMMARY_TEMPLATE=$(Get-EnvValue 'CALENDAR_SUMMARY_TEMPLATE')",
-    "LOG_LEVEL=$(Get-EnvValue 'LOG_LEVEL')"
+    "RUBITIME_ONLY_AVAILABLE=$(Optional-EnvValue 'RUBITIME_ONLY_AVAILABLE' 'true')",
+    "EVENT_TIMEZONE=$(Optional-EnvValue 'EVENT_TIMEZONE' 'Europe/Moscow')",
+    "EVENT_LOCATION=$(Optional-EnvValue 'EVENT_LOCATION' 'Москва')",
+    "CALENDAR_SUMMARY_TEMPLATE=$(Optional-EnvValue 'CALENDAR_SUMMARY_TEMPLATE' '{payment_prefix}{name} | {price}')",
+    "LOG_LEVEL=$(Optional-EnvValue 'LOG_LEVEL' 'INFO')"
 ) -join ","
 
-$secretSpec = "environment-variable=GOOGLE_SERVICE_ACCOUNT_JSON,id=$LockboxSecretId,key=$LockboxSecretKey"
-if (-not [string]::IsNullOrWhiteSpace($LockboxVersionId) -and -not $LockboxVersionId.StartsWith("<")) {
-    $secretSpec += ",version-id=$LockboxVersionId"
+function Get-OrCreateFunction($name) {
+    $existing = yc serverless function get --name $name --folder-id $FolderId --format json 2>$null | ConvertFrom-Json
+    if ($existing -and $existing.id) {
+        Write-Host "Используется существующая функция $name ($($existing.id))"
+        return $existing.id
+    }
+    Write-Host "Создание функции $name"
+    $created = yc serverless function create --name $name --folder-id $FolderId --format json | ConvertFrom-Json
+    return $created.id
 }
 
-Write-Host "== Создание функций (один раз) =="
-yc serverless function create --name $WebhookFnName --folder-id $FolderId
-yc serverless function create --name $ScheduleFnName --folder-id $FolderId
+$webhookFunctionId = Get-OrCreateFunction $WebhookFnName
+$scheduleFunctionId = Get-OrCreateFunction $ScheduleFnName
 
 Write-Host "== Публикация версии: webhook =="
 yc serverless function version create `
-    --function-name $WebhookFnName `
+    --function-id $webhookFunctionId `
     --folder-id $FolderId `
     --runtime $Runtime `
     --entrypoint webhook_handler.handler `
@@ -85,12 +107,11 @@ yc serverless function version create `
     --execution-timeout $WebhookTimeout `
     --source-path . `
     --service-account-id $ServiceAccountId `
-    --secret $secretSpec `
     --environment $envVars
 
 Write-Host "== Публикация версии: schedule =="
 yc serverless function version create `
-    --function-name $ScheduleFnName `
+    --function-id $scheduleFunctionId `
     --folder-id $FolderId `
     --runtime $Runtime `
     --entrypoint schedule_handler.handler `
@@ -98,26 +119,30 @@ yc serverless function version create `
     --execution-timeout $ScheduleTimeout `
     --source-path . `
     --service-account-id $ServiceAccountId `
-    --secret $secretSpec `
     --environment $envVars
 
 Write-Host "== Публичный доступ к webhook-функции (allUsers -> functions.functionInvoker) =="
-yc serverless function allow-unauthenticated-invoke --name $WebhookFnName --folder-id $FolderId
+yc serverless function allow-unauthenticated-invoke --id $webhookFunctionId
 
 Write-Host "== Доступ Timer к schedule-функции =="
 yc serverless function add-access-binding `
-    --name $ScheduleFnName `
-    --folder-id $FolderId `
+    --id $scheduleFunctionId `
     --role functions.functionInvoker `
     --service-account-id $ServiceAccountId
 
-Write-Host "== Timer-триггер для schedule-функции (каждые 5 минут) =="
-yc serverless trigger create timer `
-    --name rubitime-gcal-schedule-timer `
-    --folder-id $FolderId `
-    --cron-expression "*/5 * * * ? *" `
-    --invoke-function-name $ScheduleFnName `
-    --invoke-function-service-account-id $ServiceAccountId
+Write-Host "== Проверка Timer-триггера =="
+$timer = yc serverless trigger list --folder-id $FolderId --format json | ConvertFrom-Json |
+    Where-Object { $_.name -eq "rubitime-gcal-schedule-timer" }
+if (-not $timer) {
+    yc serverless trigger create timer `
+        --name rubitime-gcal-schedule-timer `
+        --folder-id $FolderId `
+        --cron-expression "*/5 * * * ? *" `
+        --invoke-function-id $scheduleFunctionId `
+        --invoke-function-service-account-id $ServiceAccountId
+} else {
+    Write-Host "Timer уже существует ($($timer.id)), создание пропущено"
+}
 
 Write-Host "Готово. URL webhook-функции:"
-yc serverless function get --name $WebhookFnName --folder-id $FolderId --format json | Select-String "http_invoke_url"
+yc serverless function get --id $webhookFunctionId --format json | Select-String "http_invoke_url"

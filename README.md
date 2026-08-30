@@ -62,8 +62,8 @@ rubitime-gcal-sync-yandex/
 | Переменная | Обязательна | Значение по умолчанию | Описание |
 |---|---:|---|---|
 | `GOOGLE_CALENDAR_ID` | да | - | ID Google Calendar, например `xxxx@group.calendar.google.com` |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | в облаке | - | JSON-ключ Google service account, сырой JSON или base64 |
-| `GOOGLE_SERVICE_ACCOUNT_JSON_FILE` | локально | - | Путь к JSON-файлу ключа для локального запуска |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | в функции | - | JSON-ключ Google service account, сырой JSON или base64 |
+| `GOOGLE_SERVICE_ACCOUNT_JSON_FILE` | локально и для деплоя | - | Путь к JSON-файлу; deploy-скрипт преобразует его в base64 и передаёт в environment функции |
 | `RUBITIME_API_KEY` | да | - | API-ключ Rubitime |
 | `RUBITIME_BRANCH_ID` | да | `0` | ID филиала |
 | `RUBITIME_COOPERATOR_ID` | да | `0` | ID сотрудника |
@@ -82,10 +82,10 @@ rubitime-gcal-sync-yandex/
 
 1. Создайте Google service account и JSON-ключ.
 2. Откройте нужный календарь в Google Calendar и предоставьте service account доступ с правом изменения событий.
-3. Для облака храните JSON-ключ в Yandex Lockbox и подключайте его к функции как `GOOGLE_SERVICE_ACCOUNT_JSON`.
-4. Для локальной разработки укажите `GOOGLE_SERVICE_ACCOUNT_JSON_FILE`.
+3. Для локальной разработки и деплоя укажите путь к файлу через `GOOGLE_SERVICE_ACCOUNT_JSON_FILE`.
+4. `deploy/deploy.ps1` преобразует файл в base64 и сохраняет значение в environment обеих функций как `GOOGLE_SERVICE_ACCOUNT_JSON`.
 
-Не добавляйте JSON-ключ в git и не передавайте его в открытой переменной окружения при production-деплое.
+Не добавляйте JSON-ключ в git. Значение `GOOGLE_SERVICE_ACCOUNT_JSON` хранится непосредственно в настройках функций Yandex Cloud; для усиления защиты при необходимости используйте закрытый проект или Lockbox.
 
 ## Локальный запуск
 
@@ -120,26 +120,26 @@ python scripts/local_invoke.py schedule
 
 Требуются установленный и авторизованный [Yandex Cloud CLI](https://yandex.cloud/ru/docs/cli/quickstart) и доступ к нужному каталогу облака.
 
-1. В начале `deploy/deploy.ps1` укажите `FolderId`, `ServiceAccountId`, имя функций и параметры Lockbox.
+1. В начале `deploy/deploy.ps1` укажите `FolderId`, `ServiceAccountId` и имена функций.
 2. Создайте `.env` на основе `.env.example` и заполните обязательные переменные.
 3. Запустите `deploy/deploy.ps1` в PowerShell.
 4. Скопируйте URL опубликованной webhook-функции в настройки webhook в Rubitime.
 
 Скрипт создаёт две функции:
 
-- `rubitime-gcal-webhook` с entrypoint `webhook_handler.handler`, публичным HTTP-вызовом и таймаутом `10s`.
+- webhook-функция с entrypoint `webhook_handler.handler`, публичным HTTP-вызовом и таймаутом `30s`.
 - `rubitime-gcal-schedule` с entrypoint `schedule_handler.handler` и таймаутом `60s`.
 
 Также скрипт выдаёт Timer доступ к schedule-функции и создаёт триггер `rubitime-gcal-schedule-timer`, запускающий синхронизацию каждые 5 минут (`*/5 * * * ? *`).
 
-Для повторного деплоя публикуйте новую версию функции. Команды создания уже существующих функций и триггера могут вернуть ошибку, поэтому их не нужно повторно выполнять без необходимости.
+Скрипт находит существующие функции по имени и публикует новую версию. Если функция ещё не создана, она создаётся автоматически. Публичный доступ webhook-функции и доступ Timer переустанавливаются безопасно. Существующий Timer повторно не создаётся.
 
 ## Мониторинг
 
 Проверка списка версий функции:
 
 ```powershell
-yc serverless function version list --function-name rubitime-gcal-webhook
+yc serverless function version list --function-name <webhook-function-name>
 ```
 
 Чтение логов за последний час:

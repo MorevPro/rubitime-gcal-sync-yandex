@@ -14,6 +14,11 @@ myagent-*.json
 tests/
 scripts/
 deploy/
+.deps/
+.deploy-source*/
+build_*.py
+*.docx
+*.png
 
 __pycache__/
 .pytest_cache/
