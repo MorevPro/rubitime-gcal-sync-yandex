@@ -28,6 +28,7 @@ AVAILABLE_SLOT_MARKER_KEY = "rubitime_slot_type"
 AVAILABLE_SLOT_MARKER_VALUE = "available"
 AVAILABLE_SLOT_SOURCE_KEY = "rubitime_source"
 AVAILABLE_SLOT_SOURCE_VALUE = "rubitime_schedule"
+RUBITIME_SERVICE_DURATION = timedelta(minutes=30)
 
 
 def _is_available(value: Any) -> bool:
@@ -43,10 +44,7 @@ def _is_available(value: Any) -> bool:
 @dataclass(frozen=True, slots=True)
 class RubitimeSlot:
     start: datetime
-
-    @property
-    def end(self) -> datetime:
-        return self.start + timedelta(hours=1)
+    end: datetime
 
 
 class RubitimeScheduleSyncService:
@@ -142,7 +140,7 @@ class RubitimeScheduleSyncService:
         slots: list[RubitimeSlot] = []
         date_count = 0
         slot_count = 0
-        
+
         for date_value, times in data.items():
             if not isinstance(times, dict):
                 continue
@@ -154,18 +152,41 @@ class RubitimeScheduleSyncService:
                     f"{date_value} {time_value}",
                     self._settings.event_timezone,
                 )
-                slots.append(RubitimeSlot(start=start))
+                slots.append(
+                    RubitimeSlot(
+                        start=start,
+                        end=start + RUBITIME_SERVICE_DURATION,
+                    )
+                )
                 slot_count += 1
 
         log.info(
             "rubitime_schedule_data_parsed",
             date_count=date_count,
             total_time_slots=slot_count,
-            available_slots=len(slots),
+            available_time_slots=len(slots),
         )
-        
+
         slots.sort(key=lambda item: item.start)
-        return slots
+        grouped_slots: list[RubitimeSlot] = []
+        for slot in slots:
+            if grouped_slots and slot.start == grouped_slots[-1].end:
+                grouped_slots[-1] = RubitimeSlot(
+                    start=grouped_slots[-1].start,
+                    end=slot.end,
+                )
+            else:
+                grouped_slots.append(slot)
+
+        log.info(
+            "rubitime_schedule_slots_grouped",
+            source_slot_count=len(slots),
+            grouped_slot_count=len(grouped_slots),
+            service_duration_minutes=int(
+                RUBITIME_SERVICE_DURATION.total_seconds() // 60
+            ),
+        )
+        return grouped_slots
 
     def build_event(self, slot: RubitimeSlot) -> GoogleEventPayload:
         tz = self._settings.event_timezone
@@ -192,44 +213,145 @@ class RubitimeScheduleSyncService:
         )
 
     def _slot_event_matches(self, event: dict[str, Any]) -> bool:
+        private = (event.get("extendedProperties") or {}).get("private") or {}
+        if (
+            private.get(AVAILABLE_SLOT_MARKER_KEY) == AVAILABLE_SLOT_MARKER_VALUE
+            and private.get(AVAILABLE_SLOT_SOURCE_KEY) == AVAILABLE_SLOT_SOURCE_VALUE
+        ):
+            return True
+
         event_id = str(event.get("id") or "").strip()
-        # Искать по префиксу ID (новый способ)
+        # Обратная совместимость со слотами, созданными до добавления marker.
         if event_id.startswith(AVAILABLE_SLOT_ID_PREFIX):
             return True
         return False
 
-    def delete_existing_slot_events(self, calendar: CalendarService) -> int:
-        # Искать события за последние 7 дней и на 7 дней вперед
+    def list_existing_slot_events(self, calendar: CalendarService) -> list[dict[str, Any]]:
+        """Return only events managed by the Rubitime schedule sync."""
         time_min = datetime.now(timezone.utc) - timedelta(days=7)
-        time_max = datetime.now(timezone.utc) + timedelta(days=7)
-        events = calendar.list_events(time_min=time_min, time_max=time_max)
-        log.info("rubitime_schedule_cleanup_started", event_count=len(events))
-        
+        events = calendar.list_events(
+            time_min=time_min,
+            private_extended_property=(
+                f"{AVAILABLE_SLOT_SOURCE_KEY}={AVAILABLE_SLOT_SOURCE_VALUE}"
+            ),
+        )
+        managed_events = [event for event in events if self._slot_event_matches(event)]
+        log.info(
+            "rubitime_schedule_existing_events_loaded",
+            event_count=len(managed_events),
+        )
+        return managed_events
+
+    @staticmethod
+    def _event_matches_payload(
+        existing: dict[str, Any],
+        desired: GoogleEventPayload,
+    ) -> bool:
+        """Compare fields owned by this integration, ignoring Google metadata."""
+        body = desired.to_calendar_body()
+        scalar_fields = (
+            "summary",
+            "description",
+            "location",
+            "colorId",
+            "transparency",
+            "status",
+        )
+        if any(existing.get(field) != body.get(field) for field in scalar_fields):
+            return False
+
+        for boundary in ("start", "end"):
+            if (existing.get(boundary) or {}).get("dateTime") != (
+                body.get(boundary) or {}
+            ).get("dateTime"):
+                return False
+
+        existing_private = (
+            (existing.get("extendedProperties") or {}).get("private") or {}
+        )
+        desired_private = (
+            (body.get("extendedProperties") or {}).get("private") or {}
+        )
+        return all(
+            existing_private.get(key) == value
+            for key, value in desired_private.items()
+        )
+
+    def reconcile_slot_events(
+        self,
+        calendar: CalendarService,
+        slots: list[RubitimeSlot],
+    ) -> dict[str, int]:
+        """Apply the in-memory diff between Rubitime and Google Calendar."""
+        desired_by_id = {
+            event.event_id: event
+            for event in (self.build_event(slot) for slot in slots)
+            if event.event_id
+        }
+        existing_by_id = {
+            str(event["id"]): event
+            for event in self.list_existing_slot_events(calendar)
+            if event.get("id")
+        }
+
+        created = 0
+        updated = 0
+        unchanged = 0
         deleted = 0
-        for event in events:
-            if not self._slot_event_matches(event):
-                continue
-            event_id = event.get("id")
-            if not event_id:
+        failed = 0
+
+        # First make the desired state available, then remove stale events.
+        for event_id, desired in desired_by_id.items():
+            existing = existing_by_id.get(event_id)
+            if existing is not None and self._event_matches_payload(existing, desired):
+                unchanged += 1
                 continue
             try:
-                calendar.delete_event(str(event_id))
-                deleted += 1
+                if existing is None:
+                    calendar.insert_event(event_id, desired)
+                    created += 1
+                    operation = "created"
+                else:
+                    calendar.update_event(event_id, desired)
+                    updated += 1
+                    operation = "updated"
                 log.debug(
-                    "rubitime_slot_deleted",
+                    f"rubitime_slot_{operation}",
                     event_id=event_id,
-                    summary=event.get("summary"),
-                    start=event.get("start", {}).get("dateTime"),
+                    start=desired.start.get("dateTime"),
+                    end=desired.end.get("dateTime"),
                 )
             except Exception as exc:
+                failed += 1
+                log.error(
+                    "rubitime_slot_upsert_failed",
+                    event_id=event_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+
+        stale_ids = existing_by_id.keys() - desired_by_id.keys()
+        for event_id in sorted(stale_ids):
+            try:
+                calendar.delete_event(event_id)
+                deleted += 1
+                log.debug("rubitime_slot_deleted", event_id=event_id)
+            except Exception as exc:
+                failed += 1
                 log.error(
                     "rubitime_slot_deletion_failed",
                     event_id=event_id,
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
-        log.info("rubitime_schedule_cleanup_finished", deleted_count=deleted)
-        return deleted
+
+        return {
+            "created_events": created,
+            "updated_events": updated,
+            "unchanged_events": unchanged,
+            "deleted_events": deleted,
+            "failed_events": failed,
+        }
 
     def sync_once(self) -> dict[str, Any]:
         if not self.is_configured():
@@ -238,47 +360,24 @@ class RubitimeScheduleSyncService:
 
         log.info("rubitime_schedule_sync_started")
         calendar = CalendarService(self._settings)
-        
+
         # Fetch schedule
         response = self.fetch_schedule()
         log.info("rubitime_schedule_response_received", status=response.get("status"), message=response.get("message"))
-        
+
         # Parse available slots
         slots = self.parse_available_slots(response)
         log.info("rubitime_schedule_slots_parsed", count=len(slots))
         
-        # Delete existing slot events
-        deleted = self.delete_existing_slot_events(calendar)
-        
-        # Create new slot events
-        created = 0
-        for slot in slots:
-            try:
-                event = self.build_event(slot)
-                calendar.insert_event(event.event_id, event)
-                created += 1
-                log.debug(
-                    "rubitime_slot_created",
-                    start=slot.start.isoformat(),
-                    end=slot.end.isoformat(),
-                )
-            except Exception as exc:
-                log.error(
-                    "rubitime_slot_creation_failed",
-                    start=slot.start.isoformat(),
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                )
+        counters = self.reconcile_slot_events(calendar, slots)
         
         log.info(
             "rubitime_schedule_sync_finished",
             available_slots=len(slots),
-            deleted_events=deleted,
-            created_events=created,
+            **counters,
         )
         return {
             "status": "ok",
             "available_slots": len(slots),
-            "deleted_events": deleted,
-            "created_events": created,
+            **counters,
         }

@@ -14,7 +14,7 @@ $ScheduleFnName    = "rubitime-gcal-schedule"
 $Runtime           = "python312"
 $Memory            = "128m"
 $WebhookTimeout    = "30s"
-$ScheduleTimeout   = "60s"
+$ScheduleTimeout   = "300s"
 $EnvFile           = ".env"                              # источник переменных ниже
 # ---------------------------------------------------------------------------
 
